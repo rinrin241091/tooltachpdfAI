@@ -481,16 +481,25 @@ class SplitEngine:
         return False
 
     def _get_effective_threshold(self, avg_confidence: float, text_preview: str, source: str) -> float:
-        """Determine threshold based on scan quality."""
-        # For text-layer PDFs, always use strict threshold
+        """
+        Determine effective threshold:
+        - If user already selected flexible mode (threshold < 1.0): ALWAYS use it, no override
+        - If user selected strict mode (threshold = 1.0): auto-adjust if OCR is poor
+        """
+        # If already in flexible mode (user explicitly chose 2/3), respect their choice
+        if self.start_threshold < 1.0:
+            return self.start_threshold
+        
+        # Only auto-adjust if in strict mode (threshold == 1.0)
+        # For text-layer PDFs, keep strict threshold
         if source == "text_layer":
             return self.start_threshold
-
-        # For OCR sources, be lenient if quality is poor
+        
+        # For OCR sources: auto-adjust from strict (1.0) to flexible (0.67) if quality is poor
         if self._is_low_quality_scan(avg_confidence, text_preview):
-            # For poor quality scans: allow 2/3 anchors instead of 3/3
-            return max(0.66, min(self.start_threshold, 0.67))
-
+            return 0.67
+        
+        # Otherwise, keep strict threshold
         return self.start_threshold
 
     def analyze_pdf(self, file_path: str) -> Dict[str, Any]:
@@ -527,8 +536,10 @@ class SplitEngine:
                     extracted["source"]
                 )
 
-                ratio = sum(1 for x in anchor_flags if x) / 3.0
-                is_start = ratio >= effective_threshold
+                # Check if this is a start page using integer comparison (avoids float rounding issues)
+                anchor_count = sum(1 for x in anchor_flags if x)
+                anchor_needed = int(effective_threshold * 3 + 0.5)  # Round: 0.67*3=2.01 → 2 needed
+                is_start = anchor_count >= anchor_needed
 
                 if idx == 0:
                     is_start = True
