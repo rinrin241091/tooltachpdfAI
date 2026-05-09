@@ -67,6 +67,7 @@ export default function DigitalizationGrid() {
   const [rows, setRows] = useState([]);
   const [hoveredPageIndex, setHoveredPageIndex] = useState(0);
   const [analysisMode, setAnalysisMode] = useState("strict");
+  const [effectiveThreshold, setEffectiveThreshold] = useState(1.0);
 
   const [loadingStage, setLoadingStage] = useState("");
   const [error, setError] = useState("");
@@ -105,7 +106,12 @@ export default function DigitalizationGrid() {
       anchor_3_title: Boolean(p.anchors?.anchor_3_title),
       text_preview: p.text_preview || "",
       confidence: Number(p.confidence || 0),
+      effective_threshold: Number(p.effective_threshold || 1.0),
     }));
+
+    // Use the first page's effective_threshold (all pages analyzed with same threshold)
+    const thresh = incoming.length > 0 ? incoming[0].effective_threshold : 1.0;
+    setEffectiveThreshold(thresh);
 
     setRows(incoming);
     setHoveredPageIndex(0);
@@ -135,7 +141,16 @@ export default function DigitalizationGrid() {
         });
 
         applyAnalyzeResult(analyzed, Number(up.total_pages || 0));
-        setSuccess("AI đã đề xuất theo quy tắc đủ 3/3 mỏ neo. Bạn có thể đánh dấu lại trước khi tách.");
+        
+        let msg = "";
+        if (analysisMode === "flexible") {
+          msg = "✅ Chế độ linh hoạt (2/3 mỏ neo): AI sẽ đề xuất nếu có ≥2 mỏ neo được phát hiện.";
+        } else if (effectiveThreshold < 1.0) {
+          msg = "⚠️ AI đã điều chỉnh ngưỡng xuống 2/3 vì tài liệu chất lượng thấp (OCR yếu). Bạn có thể đánh dấu lại.";
+        } else {
+          msg = "✅ Chế độ chặt chẽ (3/3 mỏ neo): AI sẽ đề xuất chỉ khi đủ 3 mỏ neo. Bạn có thể đánh dấu lại.";
+        }
+        setSuccess(msg);
       } catch (e) {
         setError(e?.response?.data?.detail || e.message || "Không thể tải lên hoặc phân tích file.");
       } finally {
@@ -156,7 +171,14 @@ export default function DigitalizationGrid() {
         params: { mode: analysisMode },
       });
       applyAnalyzeResult(analyzed, totalPages);
-      setSuccess("Đã phân tích lại theo quy tắc đủ 3/3 mỏ neo.");
+      
+      let msg = "";
+      if (analysisMode === "flexible") {
+        msg = "✅ Phân tích lại với chế độ linh hoạt (2/3 mỏ neo) - có thể phát hiện thêm đề xuất.";
+      } else {
+        msg = "✅ Phân tích lại với chế độ chặt chẽ (3/3 mỏ neo) - chỉ đề xuất khi đủ 3 mỏ neo.";
+      }
+      setSuccess(msg);
     } catch (e) {
       setError(e?.response?.data?.detail || e.message || "Không thể phân tích lại.");
     } finally {
@@ -254,7 +276,7 @@ export default function DigitalizationGrid() {
         <div className="mx-auto max-w-7xl">
           <h1 className="text-2xl font-bold tracking-tight">PDF Split Dashboard</h1>
           <p className="mt-1 text-sm text-sky-100">
-            Hiển thị danh sách từng trang và đánh dấu đề xuất tách theo 3 mỏ neo.
+            Hiển thị danh sách từng trang và đánh dấu đề xuất tách theo 2/3 hoặc 3/3 mỏ neo tùy chọn.
           </p>
         </div>
       </header>
@@ -268,7 +290,8 @@ export default function DigitalizationGrid() {
             className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-700"
             disabled={isBusy}
           >
-            <option value="strict">Bắt buộc 3/3 mỏ neo</option>
+            <option value="strict">Bắt buộc 3/3 mỏ neo (chặt chẽ)</option>
+            <option value="flexible">Bắt buộc 2/3 mỏ neo (linh hoạt)</option>
           </select>
           <button
             type="button"
@@ -278,6 +301,10 @@ export default function DigitalizationGrid() {
           >
             Phân tích lại
           </button>
+        </div>
+
+        <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+          <strong>💡 Gợi ý:</strong> Chọn <strong>"Linh hoạt"</strong> nếu OCR không tốt hoặc tài liệu xấu để không bỏ lỡ đề xuất. Chọn <strong>"Chặt chẽ"</strong> để chỉ đề xuất khi chắc chắn.
         </div>
 
         <div
@@ -347,7 +374,7 @@ export default function DigitalizationGrid() {
                         </p>
                         <p className="text-xs text-slate-500">
                           Điểm trang đầu: <span className="font-semibold text-slate-700">{row.start_score.toFixed(2)}</span>
-                          {" "}(ngưỡng: 1.00)
+                          {" "}(ngưỡng: {effectiveThreshold.toFixed(2)})
                         </p>
                       </div>
 

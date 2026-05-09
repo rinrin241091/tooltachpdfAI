@@ -14,8 +14,21 @@ from pdf_splitter import SplitEngine
 
 
 def _build_engine_for_mode(mode: str) -> SplitEngine:
-    # Business rule: only suggest split when all 3 anchors are present.
-    return SplitEngine(start_threshold=1.0)
+    """
+    Build SplitEngine with threshold based on analysis mode:
+    - "strict" or "3/3": Require all 3 anchors (start_threshold=1.0)
+    - "flexible" or "2/3": Accept 2 out of 3 anchors (start_threshold=0.67)
+    - "auto" or default: Automatic adjustment based on OCR quality
+    """
+    if mode in ("flexible", "2/3"):
+        # Flexible mode: accept 2/3 anchors
+        return SplitEngine(start_threshold=0.67)
+    elif mode in ("strict", "3/3"):
+        # Strict mode: require all 3 anchors
+        return SplitEngine(start_threshold=1.0)
+    else:
+        # Auto mode (default): 1.0, but will auto-adjust in analyze_pdf if OCR is poor
+        return SplitEngine(start_threshold=1.0)
 
 
 # ── directories ──────────────────────────────────────────────────────────────
@@ -51,6 +64,7 @@ class PageInfo(BaseModel):
     anchors: AnchorSignals
     text_preview: str
     confidence: float
+    effective_threshold: float  # Dynamic threshold used for this page
 
 
 class AnalyzeResponse(BaseModel):
@@ -120,6 +134,7 @@ async def analyze_pdf(file_id: str, max_pages: Optional[int] = None, mode: str =
                 ),
                 text_preview=(p.get("text_preview", "") or "")[:200],
                 confidence=float(p.get("confidence", 0.0)),
+                effective_threshold=float(p.get("effective_threshold", 1.0)),
             )
         )
 
