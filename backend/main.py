@@ -49,22 +49,32 @@ app.add_middleware(
 
 
 # ── schemas ───────────────────────────────────────────────────────────────────
+class AnchorDetail(BaseModel):
+    """Per-anchor detection result with confidence and reason."""
+    detected: bool
+    confidence: float  # 0.0 to 1.0
+    reason: str        # e.g., "exact_phrase", "standard_format", "strict_centered"
+
+
 class AnchorSignals(BaseModel):
-    anchor_1_emblem: bool
-    anchor_2_doc_number: bool
-    anchor_3_title: bool
+    anchor_1_emblem: AnchorDetail
+    anchor_2_doc_number: AnchorDetail
+    anchor_3_title: AnchorDetail
 
 
 class PageInfo(BaseModel):
     page_index: int           # 0-based
     is_start_page: bool
     start_score: float
+    weighted_score: Optional[float] = None  # Context-aware weighted score
     detected_title: str
     detected_number: str
     anchors: AnchorSignals
     text_preview: str
     confidence: float
     effective_threshold: float  # Dynamic threshold used for this page
+    emblem_type: Optional[str] = None  # "large", "small", or "none"
+    source: Optional[str] = None  # "text_layer" or "ocr"
 
 
 class AnalyzeResponse(BaseModel):
@@ -89,88 +99,137 @@ class SplitResponse(BaseModel):
 
 @app.post("/upload", summary="Upload a PDF file")
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Chỉ chấp nhận tệp PDF.")
+    try:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Chỉ chấp nhận tệp PDF.")
 
-    file_id = str(uuid.uuid4())
-    dest = UPLOAD_DIR / f"{file_id}.pdf"
-    with dest.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
+        file_id = str(uuid.uuid4())
+        dest = UPLOAD_DIR / f"{file_id}.pdf"
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-    doc = fitz.open(str(dest))
-    total_pages = len(doc)
-    doc.close()
+        doc = fitz.open(str(dest))
+        total_pages = len(doc)
+        doc.close()
+        
+        if total_pages == 0:
+            dest.unlink()
+            raise HTTPException(status_code=400, detail="Tệp PDF không có trang nào.")
 
-    return {"file_id": file_id, "filename": file.filename, "total_pages": total_pages}
+        return {"file_id": file_id, "filename": file.filename, "total_pages": total_pages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi tải lên: {str(e)}")
 
 
 @app.get("/analyze/{file_id}", response_model=AnalyzeResponse, summary="Analyze PDF pages with OCR")
 async def analyze_pdf(file_id: str, max_pages: Optional[int] = None, mode: str = "strict"):
-    pdf_path = UPLOAD_DIR / f"{file_id}.pdf"
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF.")
+    try:
+        pdf_path = UPLOAD_DIR / f"{file_id}.pdf"
+        if not pdf_path.exists():
+            raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF.")
 
-    analysis = _build_engine_for_mode(mode).analyze_pdf(str(pdf_path))
-    total_pages = int(analysis.get("total_pages", 0))
+        analysis = _build_engine_for_mode(mode).analyze_pdf(str(pdf_path))
+        total_pages = int(analysis.get("total_pages", 0))
 
-    raw_pages = analysis.get("pages", [])
-    if max_pages is not None:
-        raw_pages = raw_pages[: max(0, int(max_pages))]
+        raw_pages = analysis.get("pages", [])
+        if max_pages is not None:
+            raw_pages = raw_pages[: max(0, int(max_pages))]
 
-    pages_info: List[PageInfo] = []
-    for p in raw_pages:
-        anchors = p.get("anchors", {}) or {}
-        pages_info.append(
-            PageInfo(
-                page_index=int(p.get("page_index", 0)),
-                is_start_page=bool(p.get("is_start_page", False)),
-                start_score=float(p.get("start_score", 0.0)),
-                detected_title=p.get("detected_title", "") or "",
-                detected_number=p.get("detected_number", "") or "",
-                anchors=AnchorSignals(
-                    anchor_1_emblem=bool(anchors.get("anchor_1_emblem", False)),
-                    anchor_2_doc_number=bool(anchors.get("anchor_2_doc_number", False)),
-                    anchor_3_title=bool(anchors.get("anchor_3_title", False)),
-                ),
-                text_preview=(p.get("text_preview", "") or "")[:200],
-                confidence=float(p.get("confidence", 0.0)),
-                effective_threshold=float(p.get("effective_threshold", 1.0)),
+        pages_info: List[PageInfo] = []
+        for p in raw_pages:
+            anchors = p.get("anchors", {}) or {}
+            
+            # Extract per-anchor confidence data
+            a1 = anchors.get("anchor_1_emblem", {})
+            a2 = anchors.get("anchor_2_doc_number", {})
+            a3 = anchors.get("anchor_3_title", {})
+            
+            # Handle both legacy bool format and new AnchorDetail format
+            anchor_1_detail = a1 if isinstance(a1, dict) else {"detected": bool(a1), "confidence": 0.0, "reason": "legacy"}
+            anchor_2_detail = a2 if isinstance(a2, dict) else {"detected": bool(a2), "confidence": 0.0, "reason": "legacy"}
+            anchor_3_detail = a3 if isinstance(a3, dict) else {"detected": bool(a3), "confidence": 0.0, "reason": "legacy"}
+            
+            pages_info.append(
+                PageInfo(
+                    page_index=int(p.get("page_index", 0)),
+                    is_start_page=bool(p.get("is_start_page", False)),
+                    start_score=float(p.get("start_score", 0.0)),
+                    weighted_score=float(p.get("weighted_score", 0.0)),
+                    detected_title=p.get("detected_title", "") or "",
+                    detected_number=p.get("detected_number", "") or "",
+                    anchors=AnchorSignals(
+                        anchor_1_emblem=AnchorDetail(
+                            detected=anchor_1_detail.get("detected", False),
+                            confidence=float(anchor_1_detail.get("confidence", 0.0)),
+                            reason=anchor_1_detail.get("reason", "unknown")
+                        ),
+                        anchor_2_doc_number=AnchorDetail(
+                            detected=anchor_2_detail.get("detected", False),
+                            confidence=float(anchor_2_detail.get("confidence", 0.0)),
+                            reason=anchor_2_detail.get("reason", "unknown")
+                        ),
+                        anchor_3_title=AnchorDetail(
+                            detected=anchor_3_detail.get("detected", False),
+                            confidence=float(anchor_3_detail.get("confidence", 0.0)),
+                            reason=anchor_3_detail.get("reason", "unknown")
+                        ),
+                    ),
+                    text_preview=(p.get("text_preview", "") or "")[:200],
+                    confidence=float(p.get("confidence", 0.0)),
+                    effective_threshold=float(p.get("effective_threshold", 1.0)),
+                    emblem_type=p.get("emblem_type", "none"),
+                    source=p.get("source", "text_layer"),
+                )
             )
+
+        suggested_breaks = sorted({int(x) for x in analysis.get("suggested_breaks", [0])})
+        if not suggested_breaks or suggested_breaks[0] != 0:
+            suggested_breaks.insert(0, 0)
+
+        return AnalyzeResponse(
+            file_id=file_id,
+            total_pages=total_pages,
+            suggested_breaks=suggested_breaks,
+            pages=pages_info,
         )
-
-    suggested_breaks = sorted({int(x) for x in analysis.get("suggested_breaks", [0])})
-    if not suggested_breaks or suggested_breaks[0] != 0:
-        suggested_breaks.insert(0, 0)
-
-    return AnalyzeResponse(
-        file_id=file_id,
-        total_pages=total_pages,
-        suggested_breaks=suggested_breaks,
-        pages=pages_info,
-    )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Tệp PDF không tồn tại: {str(e)}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi xác thực: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi phân tích PDF: {str(e)}")
 
 
 @app.post("/split", response_model=SplitResponse, summary="Split PDF into sub-files")
 async def split_pdf(body: SplitRequest):
-    pdf_path = UPLOAD_DIR / f"{body.file_id}.pdf"
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF.")
+    try:
+        pdf_path = UPLOAD_DIR / f"{body.file_id}.pdf"
+        if not pdf_path.exists():
+            raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF.")
 
-    breaks = sorted({int(p) for p in body.break_points})
-    if not breaks or breaks[0] != 0:
-        breaks.insert(0, 0)
+        breaks = sorted({int(p) for p in body.break_points})
+        if not breaks or breaks[0] != 0:
+            breaks.insert(0, 0)
 
-    out_dir = OUTPUT_DIR / body.file_id
-    out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = OUTPUT_DIR / body.file_id
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    split_result = SplitEngine().split_pdf(
-        file_path=str(pdf_path),
-        output_folder=str(out_dir),
-        break_points=breaks,
-        names=body.document_names,
-    )
-    output_files = [part["file_name"] for part in split_result.get("parts", [])]
-    return SplitResponse(file_id=body.file_id, output_files=output_files)
+        split_result = SplitEngine().split_pdf(
+            file_path=str(pdf_path),
+            output_folder=str(out_dir),
+            break_points=breaks,
+            names=body.document_names,
+        )
+        output_files = [part["file_name"] for part in split_result.get("parts", [])]
+        return SplitResponse(file_id=body.file_id, output_files=output_files)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi xác thực: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi chia tách PDF: {str(e)}")
 
 
 @app.get("/file/{file_id}", summary="Get original uploaded PDF")
