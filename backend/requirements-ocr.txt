@@ -1,0 +1,7 @@
+# PaddleOCR + PaddlePaddle
+# CHI HO TRO PYTHON <= 3.12
+# Neu dang dung Python 3.13 hoac 3.14, hay cai Python 3.12 rieng
+# hoac dung conda: conda install paddlepaddle -c paddle
+
+paddlepaddle==2.6.1
+paddleocr==2.7.3
