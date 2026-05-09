@@ -10,15 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# PaddleOCR – lazy-load to avoid heavy startup time
-_ocr = None
+from pdf_splitter import SplitEngine
 
-def get_ocr():
-    global _ocr
-    if _ocr is None:
-        from paddleocr import PaddleOCR
-        _ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-    return _ocr
+
+def _build_engine_for_mode(mode: str) -> SplitEngine:
+    # Business rule: only suggest split when all 3 anchors are present.
+    return SplitEngine(start_threshold=1.0)
 
 
 # ── directories ──────────────────────────────────────────────────────────────
@@ -39,10 +36,20 @@ app.add_middleware(
 
 
 # ── schemas ───────────────────────────────────────────────────────────────────
+class AnchorSignals(BaseModel):
+    anchor_1_emblem: bool
+    anchor_2_doc_number: bool
+    anchor_3_title: bool
+
+
 class PageInfo(BaseModel):
-    page_number: int          # 0-based
+    page_index: int           # 0-based
+    is_start_page: bool
+    start_score: float
+    detected_title: str
+    detected_number: str
+    anchors: AnchorSignals
     text_preview: str
-    is_title: bool
     confidence: float
 
 
@@ -56,6 +63,7 @@ class AnalyzeResponse(BaseModel):
 class SplitRequest(BaseModel):
     file_id: str
     break_points: List[int]       # 0-based page indices (must include 0)
+    document_names: Optional[List[str]] = None
 
 
 class SplitResponse(BaseModel):
@@ -63,100 +71,12 @@ class SplitResponse(BaseModel):
     output_files: List[str]       # filenames of generated PDFs
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-def _is_title_line(text: str) -> bool:
-    """
-    Heuristic: a line is treated as a document title if it is:
-      • short (≤ 120 chars after stripping)
-      • ALL-CAPS  or  starts with a Roman/Arabic section number
-      • not purely numeric
-    """
-    stripped = text.strip()
-    if not stripped or len(stripped) > 120:
-        return False
-    if stripped.isnumeric():
-        return False
-
-    import re
-    # Numbered heading patterns: "1.", "I.", "CHƯƠNG I", "MỤC 2", etc.
-    numbered = re.match(
-        r"^(CHƯƠNG|MỤC|PHẦN|SECTION|ARTICLE|ĐIỀU|BÀN|PART)[\s\d]",
-        stripped, re.IGNORECASE
-    )
-    if numbered:
-        return True
-
-    # Roman numeral prefix
-    roman = re.match(r"^(M{0,4})(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})\.", stripped)
-    if roman and roman.group(0):
-        return True
-
-    # Digit prefix like "1.", "2.1.", "3.2.4."
-    digit_prefix = re.match(r"^\d+(\.\d+)*\.", stripped)
-    if digit_prefix:
-        return True
-
-    # All uppercase (at least 3 alpha chars)
-    alpha_chars = [c for c in stripped if c.isalpha()]
-    if len(alpha_chars) >= 3 and stripped == stripped.upper():
-        return True
-
-    return False
-
-
-def _extract_page_text(pdf_path: Path, page_number: int) -> tuple[str, float]:
-    """
-    Lay text tu mot trang PDF.
-    Uu tien text layer co san (PyMuPDF) de tiet kiem tai nguyen.
-    Chi dung PaddleOCR khi trang khong co text layer va paddleocr da duoc cai.
-    Returns (text, avg_confidence).
-    """
-    doc = fitz.open(str(pdf_path))
-    page = doc[page_number]
-    text_layer = page.get_text("text") or ""
-    has_text_layer = len(text_layer.strip()) >= 20
-
-    if has_text_layer:
-        doc.close()
-        clean = text_layer.strip().replace("\n", " ")
-        return clean, 1.0
-
-    # Trang khong co text layer → thu PaddleOCR neu co san
-    try:
-        import numpy as np
-        mat = fitz.Matrix(150 / 72, 150 / 72)
-        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-        doc.close()
-
-        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-            pix.height, pix.width, 3
-        )
-        ocr = get_ocr()
-        result = ocr.ocr(img_array, cls=True)
-
-        lines = []
-        confidences = []
-        if result and result[0]:
-            for line in result[0]:
-                lines.append(line[1][0])
-                confidences.append(float(line[1][1]))
-
-        combined = " ".join(lines)
-        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
-        return combined, avg_conf
-
-    except Exception:
-        # PaddleOCR chua cai hoac loi → tra ve chuoi rong, khong crash
-        doc.close()
-        return "", 0.0
-
-
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
 @app.post("/upload", summary="Upload a PDF file")
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+        raise HTTPException(status_code=400, detail="Chỉ chấp nhận tệp PDF.")
 
     file_id = str(uuid.uuid4())
     dest = UPLOAD_DIR / f"{file_id}.pdf"
@@ -171,37 +91,41 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 
 @app.get("/analyze/{file_id}", response_model=AnalyzeResponse, summary="Analyze PDF pages with OCR")
-async def analyze_pdf(file_id: str, max_pages: Optional[int] = None):
+async def analyze_pdf(file_id: str, max_pages: Optional[int] = None, mode: str = "strict"):
     pdf_path = UPLOAD_DIR / f"{file_id}.pdf"
     if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
+        raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF.")
 
-    doc = fitz.open(str(pdf_path))
-    total_pages = len(doc)
-    doc.close()
+    analysis = _build_engine_for_mode(mode).analyze_pdf(str(pdf_path))
+    total_pages = int(analysis.get("total_pages", 0))
 
-    limit = min(total_pages, max_pages) if max_pages else total_pages
+    raw_pages = analysis.get("pages", [])
+    if max_pages is not None:
+        raw_pages = raw_pages[: max(0, int(max_pages))]
 
     pages_info: List[PageInfo] = []
-    suggested_breaks: List[int] = [0]  # first page always starts a new doc
-
-    for i in range(limit):
-        text, conf = _extract_page_text(pdf_path, i)
-        # Check first meaningful line of OCR result
-        first_line = text.split("  ")[0] if text else ""
-        is_title = _is_title_line(first_line)
-
-        if is_title and i != 0:
-            suggested_breaks.append(i)
-
+    for p in raw_pages:
+        anchors = p.get("anchors", {}) or {}
         pages_info.append(
             PageInfo(
-                page_number=i,
-                text_preview=text[:200],
-                is_title=is_title,
-                confidence=round(conf, 4),
+                page_index=int(p.get("page_index", 0)),
+                is_start_page=bool(p.get("is_start_page", False)),
+                start_score=float(p.get("start_score", 0.0)),
+                detected_title=p.get("detected_title", "") or "",
+                detected_number=p.get("detected_number", "") or "",
+                anchors=AnchorSignals(
+                    anchor_1_emblem=bool(anchors.get("anchor_1_emblem", False)),
+                    anchor_2_doc_number=bool(anchors.get("anchor_2_doc_number", False)),
+                    anchor_3_title=bool(anchors.get("anchor_3_title", False)),
+                ),
+                text_preview=(p.get("text_preview", "") or "")[:200],
+                confidence=float(p.get("confidence", 0.0)),
             )
         )
+
+    suggested_breaks = sorted({int(x) for x in analysis.get("suggested_breaks", [0])})
+    if not suggested_breaks or suggested_breaks[0] != 0:
+        suggested_breaks.insert(0, 0)
 
     return AnalyzeResponse(
         file_id=file_id,
@@ -215,33 +139,22 @@ async def analyze_pdf(file_id: str, max_pages: Optional[int] = None):
 async def split_pdf(body: SplitRequest):
     pdf_path = UPLOAD_DIR / f"{body.file_id}.pdf"
     if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
+        raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF.")
 
-    breaks = sorted(set(body.break_points))
+    breaks = sorted({int(p) for p in body.break_points})
     if not breaks or breaks[0] != 0:
-        breaks = [0] + breaks
-
-    doc = fitz.open(str(pdf_path))
-    total_pages = len(doc)
+        breaks.insert(0, 0)
 
     out_dir = OUTPUT_DIR / body.file_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    output_files: List[str] = []
-
-    for idx, start in enumerate(breaks):
-        end = breaks[idx + 1] if idx + 1 < len(breaks) else total_pages
-        out_name = f"part_{idx + 1:03d}_pages_{start + 1}-{end}.pdf"
-        out_path = out_dir / out_name
-
-        sub_doc = fitz.open()
-        sub_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
-        sub_doc.save(str(out_path))
-        sub_doc.close()
-
-        output_files.append(out_name)
-
-    doc.close()
+    split_result = SplitEngine().split_pdf(
+        file_path=str(pdf_path),
+        output_folder=str(out_dir),
+        break_points=breaks,
+        names=body.document_names,
+    )
+    output_files = [part["file_name"] for part in split_result.get("parts", [])]
     return SplitResponse(file_id=body.file_id, output_files=output_files)
 
 
@@ -249,7 +162,7 @@ async def split_pdf(body: SplitRequest):
 async def get_file(file_id: str):
     file_path = UPLOAD_DIR / f"{file_id}.pdf"
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
+        raise HTTPException(status_code=404, detail="Không tìm thấy tệp PDF.")
     return FileResponse(
         path=str(file_path),
         media_type="application/pdf",
@@ -261,7 +174,7 @@ async def get_file(file_id: str):
 async def download_file(file_id: str, filename: str):
     file_path = OUTPUT_DIR / file_id / filename
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Output file not found.")
+        raise HTTPException(status_code=404, detail="Không tìm thấy tệp đầu ra.")
     return FileResponse(
         path=str(file_path),
         media_type="application/pdf",

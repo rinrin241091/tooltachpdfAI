@@ -42,10 +42,10 @@ export default function PdfPreviewModal({ fileUrl, startPage, endPage, onClose }
               file={fileUrl}
               onLoadSuccess={() => setLoading(false)}
               onLoadError={(err) => {
-                setError("Khong the tai PDF");
+                setError("Không thể tải PDF");
                 console.error(err);
               }}
-              loading={<div className={styles.loading}>Dang tai PDF...</div>}
+              loading={<div className={styles.loading}>Đang tải PDF...</div>}
             >
               <Page
                 pageNumber={currentPage}
