@@ -442,8 +442,8 @@ class SplitEngine:
         emblem_keywords = {"DANG", "CONG", "VIET NAM", "HOA", "XA HOI", "CHU NGHIA"}
         keyword_hits = sum(1 for kw in emblem_keywords if kw in combined_top_text)
         
-        if keyword_hits >= 3:
-            return {"detected": True, "confidence": 0.60, "reason": "weak_multi_keyword"}
+        if keyword_hits >= 5:
+            return {"detected": True, "confidence": 0.55, "reason": "weak_multi_keyword"}
 
         return {"detected": False, "confidence": 0.0, "reason": "no_emblem_keywords"}
 
@@ -451,8 +451,10 @@ class SplitEngine:
         """
         Detect document number (Số hiệu văn bản).
         Returns: {detected: bool, value: str, confidence: float, reason: str}
+        Robust to poor OCR quality on low-resolution scans.
         """
-        y_limit = page_height * 0.70
+        # Extend y_limit from 0.70 to 0.85 for poor-quality docs where number placement varies
+        y_limit = page_height * 0.85
         x_limit = page_width * 0.68
 
         def _normalize_ocr_number_noise(text_norm: str) -> str:
@@ -512,8 +514,9 @@ class SplitEngine:
 
         # Phase 2b: Combine nearby top-left lines to recover split OCR like
         # "SO:" on one line and "03-TB/DU" on the next line.
-        left_area_x_limit = page_width * 0.58
-        top_area_y_limit = page_height * 0.42
+        # Extend search area for poor-quality docs
+        left_area_x_limit = page_width * 0.65
+        top_area_y_limit = page_height * 0.55
         candidate_lines: List[Dict[str, Any]] = []
         for line in lines:
             x0, y0, x1, y1 = line["bbox"]
@@ -560,6 +563,16 @@ class SplitEngine:
             pattern = r"^SO[\s:]?(?:[A-Z]{1,4}[-/][A-Z0-9]{1,8}|[A-Z0-9].*)"
             if re.match(pattern, text_norm):
                 return {"detected": True, "value": text.strip()[:120], "confidence": 0.80, "reason": "abbreviated"}
+
+        # Phase 3b: Full-page fallback for poor OCR - if we find "SO HIEU" or "KY HIEU" marker anywhere
+        for line in lines:
+            text = line["text"]
+            text_norm = normalize_text(text)
+            text_norm = _normalize_ocr_number_noise(text_norm)
+            
+            # Catch explicit marker lines even if they have no number
+            if bool(re.search(r"\bSO\s+HIEU\b", text_norm)) or bool(re.search(r"\bKY\s+HIEU\b", text_norm)):
+                return {"detected": True, "value": text.strip()[:120], "confidence": 0.72, "reason": "marker_line_fallback"}
 
         # Phase 4: Standalone numbers in top-left
         left_area_x_limit = page_width * 0.45
@@ -727,6 +740,7 @@ class SplitEngine:
         - Previous page pattern: reduce weight if same anchors repeated
         """
         anchor_1, anchor_2, anchor_3 = anchors
+        all_three_present = anchor_1 and anchor_2 and anchor_3
         
         # Base weights
         emblem_weight = 1.0
@@ -737,7 +751,11 @@ class SplitEngine:
         if emblem_props.get("is_cover"):
             emblem_weight = 1.0  # Cover emblem = full weight
         elif emblem_props.get("emblem_size") == "small":
-            emblem_weight = 0.4  # Header emblem = less weight
+            # If all 3 anchors present on non-early pages, small emblem is likely cover, not header
+            if all_three_present and page_idx > 5:
+                emblem_weight = 1.0  # Treat as cover emblem when all anchors present
+            else:
+                emblem_weight = 0.4  # Header emblem = less weight
         else:
             emblem_weight = 0.7  # Medium emblem
 
